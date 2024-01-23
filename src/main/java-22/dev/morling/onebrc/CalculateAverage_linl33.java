@@ -22,6 +22,8 @@ import sun.misc.Unsafe;
 import java.io.IOException;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +38,7 @@ public class CalculateAverage_linl33 {
     private static final int WEATHER_STATION_LENGTH_MAX = 100;
     private static final long WEATHER_STATION_DISTINCT_MAX = 10_000L;
     private static final int N_THREADS = Runtime.getRuntime().availableProcessors();
+    // private static final int N_THREADS = 1;
 
     private static final MemorySegment ALL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED;
@@ -87,6 +90,7 @@ public class CalculateAverage_linl33 {
                 CompletableFuture.allOf(futures).join();
             }
 
+            VarHandle.fullFence();
             printSorted(maps[0]);
         }
     }
@@ -105,15 +109,22 @@ public class CalculateAverage_linl33 {
     }
 
     private static void printSorted(final SparseMap temperatureMeasurements) {
-        final var weatherStations = new AggregatedMeasurement[(int) temperatureMeasurements.size];
+        final var weatherStations = new AggregatedMeasurement[(int) ((long) SparseMap.SIZE_VH.get())];
         final var nameBuffer = new byte[WEATHER_STATION_LENGTH_MAX];
         var offset = temperatureMeasurements.denseAddress;
-        for (int i = 0; i < weatherStations.length; i++, offset += SparseMap.DATA_SCALE * Long.BYTES) {
-            final var nameAddr = UNSAFE.getLong(offset);
-            final var nameLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
+        for (int i = 0; i < weatherStations.length; i++, offset += SparseMap.DATA_SCALE) {
+            final var nameAddr = SparseMap.KEY_CACHE + SparseMap.KEY_SIZE * (i + 1);
+            var nameLength = 1;
+            for (; nameLength < SparseMap.KEY_SIZE; nameLength++) {
+                if (UNSAFE.getByte(nameAddr + nameLength) == ';') {
+                    break;
+                }
+            }
+            // final var nameLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
             MemorySegment.copy(ALL, ValueLayout.JAVA_BYTE, nameAddr, nameBuffer, 0, nameLength);
+            // MemorySegment.copy(ALL, ValueLayout.JAVA_BYTE, nameAddr, nameBuffer, 0, 1);
             final var nameStr = new String(nameBuffer, 0, nameLength, StandardCharsets.UTF_8);
-            weatherStations[i] = new AggregatedMeasurement(nameStr, i);
+            weatherStations[i] = new AggregatedMeasurement(nameStr, i + 1);
         }
 
         Arrays.sort(weatherStations);
@@ -130,7 +141,7 @@ public class CalculateAverage_linl33 {
 
     private static void printAggMeasurement(final AggregatedMeasurement aggMeasurement,
                                             final SparseMap temperatureMeasurements) {
-        final var offset = temperatureMeasurements.denseAddress + SparseMap.DATA_SCALE * Long.BYTES * aggMeasurement.id();
+        final var offset = temperatureMeasurements.denseAddress + SparseMap.DATA_SCALE * aggMeasurement.id();
 
         // name
         System.out.print(aggMeasurement.name());
@@ -194,6 +205,17 @@ public class CalculateAverage_linl33 {
 
             final var vectorLimit = this.chunkStart + ((this.chunkEnd - this.chunkStart) & -BYTE_SPECIES.vectorByteSize());
             for (long i = this.chunkStart; i < vectorLimit; i += BYTE_SPECIES.vectorByteSize()) {
+                // if (this.t == 0) {
+                // var cpuMs = Arena.ofAuto().allocate(ValueLayout.ADDRESS.withTargetLayout(ValueLayout.JAVA_INT));
+                // var nodeMs = Arena.ofAuto().allocate(ValueLayout.ADDRESS.withTargetLayout(ValueLayout.JAVA_INT));
+                // try {
+                // var r = (int) MallocArena.GETCPU.invokeExact(cpuMs, nodeMs);
+                // System.out.println(cpuMs.getAtIndex(ValueLayout.JAVA_INT, 0));
+                // } catch (Throwable e) {
+                // throw new RuntimeException(e);
+                // }
+                // }
+
                 var lfMask = ByteVector.fromMemorySegment(BYTE_SPECIES, ALL, i, ByteOrder.nativeOrder())
                         .eq((byte) '\n')
                         .toLong();
@@ -273,119 +295,235 @@ public class CalculateAverage_linl33 {
      * Open addressing, linear probing hash map backed by off-heap memory
      */
     private static class SparseMap {
-        private static final int TRUNCATED_HASH_BITS = 26;
+//        public static final int TRUNCATED_HASH_BITS = 18;
+        public static final int TRUNCATED_HASH_BITS = 26;
         // max # of unique keys
-        private static final long DENSE_SIZE = WEATHER_STATION_DISTINCT_MAX;
+        public static final long DENSE_SIZE = WEATHER_STATION_DISTINCT_MAX + 1;
         // max hash code (exclusive)
-        private static final long SPARSE_SIZE = 1L << (TRUNCATED_HASH_BITS + 1);
-        private static final long DATA_SCALE = 4;
+        public static final long SPARSE_SIZE = 1L << (TRUNCATED_HASH_BITS + 1);
+        public static final long DATA_SCALE = 32;
+        public static final long SPARSE_SCALE = 64;
+        // add 1 to include delimiter
+        public static final long KEY_SIZE = ((WEATHER_STATION_LENGTH_MAX + 1) + 64) & -64;
 
-        public final long sparseAddress;
+        public static final long SHARED;
+        public static final long KEY_CACHE;
+        public static final VarHandle SIZE_VH;
+
+        static {
+            final var shared = new CallocArena(Arena.global()).allocate(ValueLayout.JAVA_BYTE, SPARSE_SIZE * SPARSE_SCALE);
+            SHARED = (shared.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
+
+            final var keyCache = new MallocArena(Arena.global()).allocate(ValueLayout.JAVA_BYTE, KEY_SIZE * DENSE_SIZE);
+            KEY_CACHE = (keyCache.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
+
+            // TODO: use int
+            final var sizeMs = Arena.global().allocate(ValueLayout.JAVA_LONG.withByteAlignment(64));
+            final var sizeVh = ValueLayout.JAVA_LONG.withByteAlignment(64).varHandle();
+            SIZE_VH = MethodHandles.insertCoordinates(MethodHandles.insertCoordinates(sizeVh, 1, 0L), 0, sizeMs);
+        }
+
+        // public final long sparseAddress;
         public final long denseAddress;
-        public long size;
+        // public long size;
 
         public SparseMap() {
             var arena = new MallocArena(Arena.global());
-            var callocArena = new CallocArena(Arena.global());
+            // var callocArena = new CallocArena(Arena.global());
 
-            this.size = 0L;
+            // this.size = 0L;
 
-            final var sparse = callocArena.allocate(ValueLayout.JAVA_LONG, SPARSE_SIZE);
-            this.sparseAddress = (sparse.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
+            // final var sparse = callocArena.allocate(ValueLayout.JAVA_LONG, SPARSE_SIZE);
+            // this.sparseAddress = (sparse.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
 
-            final var dense = arena.allocate(ValueLayout.JAVA_LONG, DENSE_SIZE * DATA_SCALE);
+            final var dense = arena.allocate(ValueLayout.JAVA_BYTE, DATA_SCALE * DENSE_SIZE);
             this.denseAddress = (dense.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
+
+            final var denseTemplate = arena.allocate(ValueLayout.JAVA_BYTE, DATA_SCALE * 2);
+            final var denseTemplateAddress = (denseTemplate.address() + 64) & -64;
+            UNSAFE.putLong(denseTemplateAddress + Integer.BYTES * 2, 0L);
+            UNSAFE.putInt(denseTemplateAddress + Integer.BYTES * 4, 0);
+            UNSAFE.putInt(denseTemplateAddress + Integer.BYTES * 5, 999);
+            UNSAFE.putInt(denseTemplateAddress + Integer.BYTES * 6, -999);
+            UNSAFE.copyMemory(denseTemplateAddress, denseTemplateAddress + DATA_SCALE, DATA_SCALE);
+
+            for (long i = 0; i < DENSE_SIZE; i += 2) {
+                UNSAFE.copyMemory(denseTemplateAddress, this.denseAddress + DATA_SCALE * i, DATA_SCALE * 2);
+            }
         }
 
         public void putEntry(final long keyAddress, final int keyLength, final int value) {
             final var hash = hash(keyAddress, keyLength);
-            this.putEntryInternal(hash, keyAddress, keyLength, value, 1, value, value);
+            this.putEntryInternal(hash, keyAddress, keyLength, value);
         }
 
         private void putEntryInternal(final long hash,
                                       final long keyAddress,
                                       final int keyLength,
-                                      final long temperature,
-                                      final int count,
-                                      final int temperatureMin,
-                                      final int temperatureMax) {
-            final var sparseOffset = this.sparseAddress + truncateHash(hash) * Long.BYTES;
+                                      final int temperature) {
+            final var truncatedHash = truncateHash(hash);
+            final var sparseOffset = SHARED + SPARSE_SCALE * truncatedHash;
+            final var sparseLimit = sparseOffset + WEATHER_STATION_DISTINCT_MAX * SPARSE_SCALE;
 
-            for (long n = 0, sparseLinearOffset = sparseOffset; n < WEATHER_STATION_DISTINCT_MAX; n++, sparseLinearOffset += Long.BYTES) {
-                final var denseOffset = UNSAFE.getLong(sparseLinearOffset);
-                if (denseOffset == 0L) {
-                    this.add(sparseLinearOffset, keyAddress, keyLength, temperature, count, temperatureMin, temperatureMax);
-                    this.size++;
-                    return;
+            for (long sparseLinearOffset = sparseOffset; sparseLinearOffset < sparseLimit; sparseLinearOffset += SPARSE_SCALE) {
+                // VarHandle.fullFence();
+                var shared = UNSAFE.getInt(null, sparseLinearOffset);
+                if (shared <= 0) {
+                    final var swapped = UNSAFE.compareAndSwapInt(null, sparseLinearOffset, 0, -1);
+                    if (swapped) {
+//                        System.out.println(Long.toBinaryString(truncatedHash));
+                        // System.out.println(sparseLinearOffset);
+                        final var prevSize = (long) SIZE_VH.getAndAdd((long) 1L);
+                        // System.out.println(hashSet);
+//                        if (prevSize > DENSE_SIZE) {
+//                            throw new IllegalStateException();
+//                        }
+
+                        final var denseIdx = prevSize + 1;
+                        final var keyCacheOffset = KEY_CACHE + KEY_SIZE * denseIdx;
+                        // +1 to copy the delimiter
+                        UNSAFE.copyMemory(keyAddress, keyCacheOffset, keyLength + 1);
+                        UNSAFE.putLong(sparseLinearOffset + 8, keyAddress);
+                        VarHandle.releaseFence();
+                        UNSAFE.putIntVolatile(null, sparseLinearOffset, (int) denseIdx);
+                        shared = (int) denseIdx;
+                    }
+                    else {
+                        // another thread is updating the same entry
+                        do {
+                            Thread.onSpinWait();
+                            shared = UNSAFE.getIntVolatile(null, sparseLinearOffset);
+                        } while (shared <= 0);
+                    }
                 }
 
-                if (isCollision(keyAddress, keyLength, denseOffset)) {
+//                 final var keyCacheAddr = KEY_CACHE + KEY_SIZE * shared;
+                final var keyCacheAddr = UNSAFE.getLong(sparseLinearOffset + 8);
+                if (mismatch(keyAddress, keyCacheAddr, keyLength)) {
+                    System.out.println("collision");
+                    // hash collision
                     continue;
                 }
 
-                final var currTotal = UNSAFE.getLong(denseOffset + Integer.BYTES * 2);
-                UNSAFE.putLong(denseOffset + Integer.BYTES * 2, currTotal + temperature); // total
+                // final var denseOffset = UNSAFE.getLong(sparseLinearOffset);
+                // if (denseOffset == 0L) {
+                // this.add(sparseLinearOffset, keyAddress, keyLength, temperature, count, temperatureMin, temperatureMax);
+                // this.size++;
+                // return;
+                // }
 
-                final var currCount = UNSAFE.getInt(denseOffset + Integer.BYTES * 4);
-                UNSAFE.putInt(denseOffset + Integer.BYTES * 4, currCount + count); // count
+                // if (isCollision(keyAddress, keyLength, denseOffset)) {
+                // continue;
+                // }
 
-                final var currMin = UNSAFE.getInt(denseOffset + Integer.BYTES * 5);
-                if (temperatureMin < currMin) {
-                    UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin); // min
-                }
+                // final var currMin = UNSAFE.getInt(denseOffset + Integer.BYTES * 5);
+                // final var currMax = UNSAFE.getInt(denseOffset + Integer.BYTES * 6);
+                // final var currTotal = UNSAFE.getLong(denseOffset + Integer.BYTES * 2);
+                // final var currCount = UNSAFE.getInt(denseOffset + Integer.BYTES * 4);
+                //
+                // UNSAFE.putLong(denseOffset + Integer.BYTES * 2, currTotal + temperature); // total
+                // UNSAFE.putInt(denseOffset + Integer.BYTES * 4, currCount + count); // count
+                //
+                // if (temperatureMin < currMin) {
+                // UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin); // min
+                // }
+                //
+                // if (temperatureMax > currMax) {
+                // UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax); // max
+                // }
 
-                final var currMax = UNSAFE.getInt(denseOffset + Integer.BYTES * 6);
-                if (temperatureMax > currMax) {
-                    UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax); // max
-                }
-
+                this.putEntryAtIndex(shared, temperature, 1, temperature, temperature);
                 return;
             }
         }
 
-        public void merge(final SparseMap other) {
-            final var otherSize = other.size;
-            for (long i = 0, offset = other.denseAddress; i < otherSize; i++, offset += DATA_SCALE * Long.BYTES) {
-                final var keyAddress = UNSAFE.getLong(offset);
-                final var keyLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
-                final var hash = hash(keyAddress, keyLength);
+        private void putEntryAtIndex(final long denseIdx,
+                                     final long temperature,
+                                     final int count,
+                                     final int temperatureMin,
+                                     final int temperatureMax) {
+            final var denseOffset = this.denseAddress + DATA_SCALE * denseIdx;
 
-                this.putEntryInternal(
-                        hash,
-                        keyAddress,
-                        keyLength,
+            VarHandle.acquireFence();
+            UNSAFE.putIntVolatile(null, denseOffset + Integer.BYTES * 7, 1);
+            final var currMin = UNSAFE.getInt(denseOffset + Integer.BYTES * 5);
+            final var currMax = UNSAFE.getInt(denseOffset + Integer.BYTES * 6);
+            final var currTotal = UNSAFE.getLong(denseOffset + Integer.BYTES * 2);
+            final var currCount = UNSAFE.getInt(denseOffset + Integer.BYTES * 4);
+
+            UNSAFE.putLong(denseOffset + Integer.BYTES * 2, currTotal + temperature); // total
+            UNSAFE.putInt(denseOffset + Integer.BYTES * 4, currCount + count); // count
+
+            if (temperatureMin < currMin) {
+                UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin); // min
+            }
+
+            if (temperatureMax > currMax) {
+                UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax); // max
+            }
+            VarHandle.releaseFence();
+            UNSAFE.putOrderedInt(null, denseOffset + Integer.BYTES * 7, 1);
+        }
+
+        public void merge(final SparseMap other) {
+            final var size = (long) SIZE_VH.getVolatile();
+            for (long i = 0; i < size; i++) {
+                var offset = other.denseAddress + DATA_SCALE * (i + 1);
+                var count = UNSAFE.getInt(offset + Integer.BYTES * 4);
+                if (count == 0) {
+                    continue;
+                }
+
+                this.putEntryAtIndex(
+                        i + 1,
                         UNSAFE.getLong(offset + Integer.BYTES * 2),
-                        UNSAFE.getInt(offset + Integer.BYTES * 4),
+                        count,
                         UNSAFE.getInt(offset + Integer.BYTES * 5),
                         UNSAFE.getInt(offset + Integer.BYTES * 6));
             }
+
+            // final var otherSize = other.size;
+            // for (long i = 0, offset = other.denseAddress; i < otherSize; i++, offset += DATA_SCALE) {
+            // final var keyAddress = UNSAFE.getLong(offset);
+            // final var keyLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
+            // final var hash = hash(keyAddress, keyLength);
+            //
+            // this.putEntryInternal(
+            // hash,
+            // keyAddress,
+            // keyLength,
+            // UNSAFE.getLong(offset + Integer.BYTES * 2),
+            // UNSAFE.getInt(offset + Integer.BYTES * 4),
+            // UNSAFE.getInt(offset + Integer.BYTES * 5),
+            // UNSAFE.getInt(offset + Integer.BYTES * 6));
+            // }
         }
 
-        private void add(final long sparseOffset,
-                         final long keyAddress,
-                         final int keyLength,
-                         final long temperature,
-                         final int count,
-                         final int temperatureMin,
-                         final int temperatureMax) {
-            // new entry, initialize sparse and dense
-            final var denseOffset = this.denseAddress + this.size * DATA_SCALE * Long.BYTES;
-            UNSAFE.putLong(sparseOffset, denseOffset);
-
-            UNSAFE.putLong(denseOffset, keyAddress);
-            UNSAFE.putLong(denseOffset + Integer.BYTES * 2, temperature);
-            UNSAFE.putInt(denseOffset + Integer.BYTES * 4, count);
-            UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin);
-            UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax);
-            UNSAFE.putInt(denseOffset + Integer.BYTES * 7, keyLength);
-        }
-
-        private static boolean isCollision(final long keyAddress, final int keyLength, final long denseOffset) {
-            // key length compare is unnecessary
-
-            final var entryKeyAddress = UNSAFE.getLong(denseOffset);
-            return mismatch(keyAddress, entryKeyAddress, keyLength);
-        }
+        // private void add(final long sparseOffset,
+        // final long keyAddress,
+        // final int keyLength,
+        // final long temperature,
+        // final int count,
+        // final int temperatureMin,
+        // final int temperatureMax) {
+        // // new entry, initialize sparse and dense
+        // final var denseOffset = this.denseAddress + this.size * DATA_SCALE;
+        // UNSAFE.putLong(sparseOffset, denseOffset);
+        //
+        // UNSAFE.putLong(denseOffset, keyAddress);
+        // UNSAFE.putLong(denseOffset + Integer.BYTES * 2, temperature);
+        // UNSAFE.putInt(denseOffset + Integer.BYTES * 4, count);
+        // UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin);
+        // UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax);
+        // UNSAFE.putInt(denseOffset + Integer.BYTES * 7, keyLength);
+        // }
+        //
+        // private static boolean isCollision(final long keyAddress, final int keyLength, final long denseOffset) {
+        // // key length compare is unnecessary
+        //
+        // final var entryKeyAddress = UNSAFE.getLong(denseOffset);
+        // return mismatch(keyAddress, entryKeyAddress, keyLength);
+        // }
 
         private static boolean mismatch(final long leftAddr, final long rightAddr, final int length) {
             // key length compare is unnecessary
@@ -428,7 +566,20 @@ public class CalculateAverage_linl33 {
         }
 
         private static long truncateHash(final long hash) {
+////            var hash32 = (((hash >>> 32) ^ hash) & 0xffffffffL);
+//            var hash32 = hash;
+//            hash32 ^= hash32 >>> 16;
+////            hash32 *= 0x85ebca6bL;
+//            hash32 *= 0x21f0aaadL;
+////            hash32 *= 0xd35a2d97L;
+////            hash32 *= 0x7feb352dL;
+////            hash32 ^= hash32 >>> 13;
+//            hash32 ^= hash32 >>> 15;
+////            hash32 *= 0xc2b2ae35L;
+////            hash32 ^= hash32 >>> 16;
+
             return ((hash >>> TRUNCATED_HASH_BITS) ^ hash) & ((1L << TRUNCATED_HASH_BITS) - 1L);
+//            return hash32 & ((1L << TRUNCATED_HASH_BITS) - 1L);
         }
     }
 
@@ -450,6 +601,10 @@ public class CalculateAverage_linl33 {
                 LINKER.defaultLookup().find("calloc").orElseThrow(),
                 FunctionDescriptor.of(C_POINTER, C_SIZE_T, C_SIZE_T),
                 Linker.Option.critical(false));
+
+        public static final MethodHandle GETCPU = LINKER.downcallHandle(
+                LINKER.defaultLookup().find("getcpu").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 
         private final Arena arena;
 
