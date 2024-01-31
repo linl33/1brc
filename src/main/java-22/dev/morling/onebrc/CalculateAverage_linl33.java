@@ -107,8 +107,9 @@ public class CalculateAverage_linl33 {
     private static void printSorted(final SparseMap temperatureMeasurements) {
         final var weatherStations = new AggregatedMeasurement[(int) temperatureMeasurements.size];
         final var nameBuffer = new byte[WEATHER_STATION_LENGTH_MAX];
+
         var offset = temperatureMeasurements.denseAddress;
-        for (int i = 0; i < weatherStations.length; i++, offset += SparseMap.DATA_SCALE * Long.BYTES) {
+        for (int i = 0; i < weatherStations.length; i++, offset += SparseMap.DENSE_SCALE) {
             final var nameAddr = UNSAFE.getLong(offset);
             final var nameLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
             MemorySegment.copy(ALL, ValueLayout.JAVA_BYTE, nameAddr, nameBuffer, 0, nameLength);
@@ -130,7 +131,7 @@ public class CalculateAverage_linl33 {
 
     private static void printAggMeasurement(final AggregatedMeasurement aggMeasurement,
                                             final SparseMap temperatureMeasurements) {
-        final var offset = temperatureMeasurements.denseAddress + SparseMap.DATA_SCALE * Long.BYTES * aggMeasurement.id();
+        final var offset = temperatureMeasurements.denseAddress + SparseMap.DENSE_SCALE * aggMeasurement.id();
 
         // name
         System.out.print(aggMeasurement.name());
@@ -278,7 +279,8 @@ public class CalculateAverage_linl33 {
         private static final long DENSE_SIZE = WEATHER_STATION_DISTINCT_MAX;
         // max hash code (exclusive)
         private static final long SPARSE_SIZE = 1L << (TRUNCATED_HASH_BITS + 1);
-        private static final long DATA_SCALE = 4;
+        public static final long SPARSE_SCALE = 32;
+        public static final long DENSE_SCALE = 32;
 
         public final long sparseAddress;
         public final long denseAddress;
@@ -290,10 +292,10 @@ public class CalculateAverage_linl33 {
 
             this.size = 0L;
 
-            final var sparse = callocArena.allocate(ValueLayout.JAVA_LONG, SPARSE_SIZE);
+            final var sparse = callocArena.allocate(ValueLayout.JAVA_BYTE, SPARSE_SIZE * SPARSE_SCALE);
             this.sparseAddress = (sparse.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
 
-            final var dense = arena.allocate(ValueLayout.JAVA_LONG, DENSE_SIZE * DATA_SCALE);
+            final var dense = arena.allocate(ValueLayout.JAVA_BYTE, DENSE_SIZE * DENSE_SCALE);
             this.denseAddress = (dense.address() + MallocArena.MAX_ALIGN) & -MallocArena.MAX_ALIGN;
         }
 
@@ -309,9 +311,9 @@ public class CalculateAverage_linl33 {
                                       final int count,
                                       final int temperatureMin,
                                       final int temperatureMax) {
-            final var sparseOffset = this.sparseAddress + truncateHash(hash) * Long.BYTES;
+            final var sparseOffset = this.sparseAddress + truncateHash(hash) * SPARSE_SCALE;
 
-            for (long n = 0, sparseLinearOffset = sparseOffset; n < WEATHER_STATION_DISTINCT_MAX; n++, sparseLinearOffset += Long.BYTES) {
+            for (long n = 0, sparseLinearOffset = sparseOffset; n < WEATHER_STATION_DISTINCT_MAX; n++, sparseLinearOffset += SPARSE_SCALE) {
                 final var denseOffset = UNSAFE.getLong(sparseLinearOffset);
                 if (denseOffset == 0L) {
                     this.add(sparseLinearOffset, keyAddress, keyLength, temperature, count, temperatureMin, temperatureMax);
@@ -323,20 +325,20 @@ public class CalculateAverage_linl33 {
                     continue;
                 }
 
-                final var currTotal = UNSAFE.getLong(denseOffset + Integer.BYTES * 2);
-                UNSAFE.putLong(denseOffset + Integer.BYTES * 2, currTotal + temperature); // total
-
-                final var currCount = UNSAFE.getInt(denseOffset + Integer.BYTES * 4);
-                UNSAFE.putInt(denseOffset + Integer.BYTES * 4, currCount + count); // count
-
                 final var currMin = UNSAFE.getInt(denseOffset + Integer.BYTES * 5);
+                final var currMax = UNSAFE.getInt(denseOffset + Integer.BYTES * 6);
+                final var currTotal = UNSAFE.getLong(denseOffset + Integer.BYTES * 2);
+                final var currCount = UNSAFE.getInt(denseOffset + Integer.BYTES * 4);
+
+                UNSAFE.putLong(denseOffset + Integer.BYTES * 2, currTotal + temperature);
+                UNSAFE.putInt(denseOffset + Integer.BYTES * 4, currCount + count);
+
                 if (temperatureMin < currMin) {
-                    UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin); // min
+                    UNSAFE.putInt(denseOffset + Integer.BYTES * 5, temperatureMin);
                 }
 
-                final var currMax = UNSAFE.getInt(denseOffset + Integer.BYTES * 6);
                 if (temperatureMax > currMax) {
-                    UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax); // max
+                    UNSAFE.putInt(denseOffset + Integer.BYTES * 6, temperatureMax);
                 }
 
                 return;
@@ -345,7 +347,7 @@ public class CalculateAverage_linl33 {
 
         public void merge(final SparseMap other) {
             final var otherSize = other.size;
-            for (long i = 0, offset = other.denseAddress; i < otherSize; i++, offset += DATA_SCALE * Long.BYTES) {
+            for (long i = 0, offset = other.denseAddress; i < otherSize; i++, offset += DENSE_SCALE) {
                 final var keyAddress = UNSAFE.getLong(offset);
                 final var keyLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
                 final var hash = hash(keyAddress, keyLength);
@@ -369,7 +371,7 @@ public class CalculateAverage_linl33 {
                          final int temperatureMin,
                          final int temperatureMax) {
             // new entry, initialize sparse and dense
-            final var denseOffset = this.denseAddress + this.size * DATA_SCALE * Long.BYTES;
+            final var denseOffset = this.denseAddress + this.size * DENSE_SCALE;
             UNSAFE.putLong(sparseOffset, denseOffset);
 
             UNSAFE.putLong(denseOffset, keyAddress);
